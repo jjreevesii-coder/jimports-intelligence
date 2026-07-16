@@ -1,0 +1,17 @@
+# Google credentials
+client_secret.json
+token.json
+
+# Python
+.venv/
+__pycache__/
+*.py[cod]
+.DS_Store
+
+# Generated data
+data/*.csv
+data/*.json
+jimports_video_performance.csv
+
+# Local configuration
+.env
