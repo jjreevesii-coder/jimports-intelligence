@@ -30,7 +30,10 @@ security = HTTPBearer(auto_error=False)
 app = FastAPI(
     title="Jimports Intelligence API",
     description="Read-only YouTube and YouTube Analytics data for Jimports.",
-    version="1.0.0",
+    version="1.1.0",
+    servers=[
+        {"url": "https://jimports-intelligence.onrender.com"}
+    ],
 )
 
 
@@ -482,3 +485,312 @@ def compare(
             for video_id in ids
         ],
     }
+
+
+# --- JIMPORTS DIAGNOSTICS V2 ---
+
+TRAFFIC_SOURCE_LABELS = {
+    "RELATED_VIDEO": "Suggested videos",
+    "YT_SEARCH": "YouTube Search",
+    "SUBSCRIBER": "Subscriptions",
+    "EXT_URL": "External websites and apps",
+    "NOTIFICATION": "Notifications",
+    "PLAYLIST": "Playlists",
+    "YT_CHANNEL": "Channel pages",
+    "END_SCREEN": "End screens",
+    "SHORTS": "Shorts feed",
+    "NO_LINK_OTHER": "Other YouTube features",
+    "NO_LINK_EMBEDDED": "Embedded players",
+    "YT_OTHER_PAGE": "Other YouTube pages",
+    "ADVERTISING": "YouTube advertising",
+    "HASHTAGS": "Hashtag pages",
+    "SOUND_PAGE": "Sound pages",
+    "VIDEO_REMIXES": "Video remixes",
+}
+
+
+def resolve_video_window(
+    youtube,
+    video_id: str,
+    window: str,
+):
+    metadata = get_video_metadata(
+        youtube,
+        [video_id],
+    ).get(video_id)
+
+    if not metadata:
+        raise HTTPException(
+            status_code=404,
+            detail="Video not found.",
+        )
+
+    published_date = date.fromisoformat(
+        metadata["published_at"][:10]
+    )
+    yesterday = date.today() - timedelta(days=1)
+
+    if window == "7":
+        target_end = published_date + timedelta(days=6)
+    elif window == "28":
+        target_end = published_date + timedelta(days=27)
+    elif window == "lifetime":
+        target_end = yesterday
+    else:
+        raise HTTPException(
+            status_code=400,
+            detail="Window must be 7, 28, or lifetime.",
+        )
+
+    actual_end = min(target_end, yesterday)
+    complete = yesterday >= target_end
+
+    return (
+        metadata,
+        published_date,
+        actual_end,
+        complete,
+    )
+
+
+@app.get(
+    "/video/{video_id}/retention",
+    operation_id="getVideoRetention",
+    summary="Get the detailed audience-retention curve for one video",
+    dependencies=[Depends(require_api_key)],
+)
+def video_retention(
+    video_id: str,
+    window: str = Query(
+        default="lifetime",
+        pattern="^(7|28|lifetime)$",
+    ),
+):
+    try:
+        youtube, analytics = get_services()
+
+        (
+            metadata,
+            start_date,
+            end_date,
+            complete,
+        ) = resolve_video_window(
+            youtube,
+            video_id,
+            window,
+        )
+
+        if end_date < start_date:
+            return {
+                **metadata,
+                "window": window,
+                "window_complete": complete,
+                "points": [],
+                "summary": {},
+            }
+
+        report = analytics.reports().query(
+            ids="channel==MINE",
+            startDate=start_date.isoformat(),
+            endDate=end_date.isoformat(),
+            dimensions="elapsedVideoTimeRatio",
+            metrics=(
+                "audienceWatchRatio,"
+                "relativeRetentionPerformance"
+            ),
+            filters=f"video=={video_id}",
+        ).execute()
+
+        headers = [
+            column["name"]
+            for column in report.get("columnHeaders", [])
+        ]
+
+        raw_rows = [
+            dict(zip(headers, row))
+            for row in report.get("rows", [])
+        ]
+
+        duration_seconds = metadata["duration_seconds"]
+        points = []
+
+        for row in raw_rows:
+            elapsed_ratio = float(
+                row.get("elapsedVideoTimeRatio", 0)
+            )
+            audience_ratio = float(
+                row.get("audienceWatchRatio", 0)
+            )
+            relative_score = float(
+                row.get("relativeRetentionPerformance", 0)
+            )
+
+            points.append({
+                "elapsed_ratio": round(elapsed_ratio, 4),
+                "elapsed_seconds": round(
+                    elapsed_ratio * duration_seconds,
+                    1,
+                ),
+                "audience_retention_percent": round(
+                    audience_ratio * 100,
+                    2,
+                ),
+                "relative_retention_score": round(
+                    relative_score,
+                    4,
+                ),
+            })
+
+        points.sort(key=lambda value: value["elapsed_ratio"])
+
+        def nearest_point(target_ratio: float):
+            if not points:
+                return None
+
+            return min(
+                points,
+                key=lambda value: abs(
+                    value["elapsed_ratio"] - target_ratio
+                ),
+            )
+
+        thirty_second_ratio = min(
+            30 / duration_seconds,
+            1,
+        ) if duration_seconds else 0
+
+        summary = {
+            "start": nearest_point(0),
+            "thirty_seconds": nearest_point(
+                thirty_second_ratio
+            ),
+            "quarter": nearest_point(0.25),
+            "midpoint": nearest_point(0.50),
+            "three_quarters": nearest_point(0.75),
+            "ending": nearest_point(0.95),
+        }
+
+        return {
+            **metadata,
+            "window": window,
+            "period_start": start_date.isoformat(),
+            "period_end": end_date.isoformat(),
+            "window_complete": complete,
+            "summary": summary,
+            "points": points,
+        }
+
+    except HttpError as error:
+        raise HTTPException(
+            status_code=502,
+            detail=f"YouTube API error: {error}",
+        ) from error
+
+
+@app.get(
+    "/video/{video_id}/traffic-sources",
+    operation_id="getVideoTrafficSources",
+    summary="Get the traffic sources for one video",
+    dependencies=[Depends(require_api_key)],
+)
+def video_traffic_sources(
+    video_id: str,
+    window: str = Query(
+        default="lifetime",
+        pattern="^(7|28|lifetime)$",
+    ),
+):
+    try:
+        youtube, analytics = get_services()
+
+        (
+            metadata,
+            start_date,
+            end_date,
+            complete,
+        ) = resolve_video_window(
+            youtube,
+            video_id,
+            window,
+        )
+
+        if end_date < start_date:
+            return {
+                **metadata,
+                "window": window,
+                "window_complete": complete,
+                "sources": [],
+            }
+
+        report = analytics.reports().query(
+            ids="channel==MINE",
+            startDate=start_date.isoformat(),
+            endDate=end_date.isoformat(),
+            dimensions="insightTrafficSourceType",
+            metrics="views,estimatedMinutesWatched",
+            filters=f"video=={video_id}",
+            sort="-views",
+            maxResults=50,
+        ).execute()
+
+        headers = [
+            column["name"]
+            for column in report.get("columnHeaders", [])
+        ]
+
+        rows = [
+            dict(zip(headers, row))
+            for row in report.get("rows", [])
+        ]
+
+        total_views = sum(
+            int(row.get("views", 0))
+            for row in rows
+        )
+
+        sources = []
+
+        for row in rows:
+            source_type = str(
+                row.get("insightTrafficSourceType", "")
+            )
+            views = int(row.get("views", 0))
+
+            sources.append({
+                "source_type": source_type,
+                "source_label": TRAFFIC_SOURCE_LABELS.get(
+                    source_type,
+                    source_type.replace("_", " ").title(),
+                ),
+                "views": views,
+                "share_of_views_percent": (
+                    round(views / total_views * 100, 2)
+                    if total_views
+                    else 0
+                ),
+                "watch_hours": round(
+                    float(
+                        row.get(
+                            "estimatedMinutesWatched",
+                            0,
+                        )
+                    ) / 60,
+                    2,
+                ),
+            })
+
+        return {
+            **metadata,
+            "window": window,
+            "period_start": start_date.isoformat(),
+            "period_end": end_date.isoformat(),
+            "window_complete": complete,
+            "total_views_in_report": total_views,
+            "sources": sources,
+        }
+
+    except HttpError as error:
+        raise HTTPException(
+            status_code=502,
+            detail=f"YouTube API error: {error}",
+        ) from error
