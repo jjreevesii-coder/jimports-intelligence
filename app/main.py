@@ -1115,3 +1115,335 @@ def audit_video(
         ],
         "recommendation_allowed": status in {"PASS", "WARN"},
     }
+
+
+# --- JIMPORTS RETENTION BENCHMARK V1 ---
+
+from app.benchmark_layer import summarize_checkpoint
+
+
+@app.get(
+    "/video/{video_id}/retention-benchmark",
+    operation_id="benchmarkVideoRetention",
+    summary=(
+        "Compare a video's first 7- or 28-day retention "
+        "with similar-length Jimports videos"
+    ),
+    dependencies=[Depends(require_api_key)],
+)
+def retention_benchmark(
+    video_id: str,
+    window: str = Query(
+        default="7",
+        pattern="^(7|28)$",
+    ),
+    max_peers: int = Query(
+        default=6,
+        ge=5,
+        le=10,
+    ),
+    runtime_tolerance: float = Query(
+        default=0.25,
+        ge=0.10,
+        le=0.50,
+        description=(
+            "Maximum runtime difference from the target. "
+            "Default 0.25 means plus or minus 25 percent."
+        ),
+    ),
+):
+    target = video_retention(
+        video_id=video_id,
+        window=window,
+    )
+
+    target_summary = target.get(
+        "summary",
+        {},
+    )
+
+    if not target.get("window_complete"):
+        return {
+            "benchmark_status": "FAIL",
+            "video_id": video_id,
+            "title": target.get("title"),
+            "window": window,
+            "reason": (
+                f"The target video's first {window}-day "
+                "window is not complete."
+            ),
+            "recommendation_allowed": False,
+        }
+
+    if not target_summary:
+        raise HTTPException(
+            status_code=502,
+            detail=(
+                "No retention data was returned "
+                "for the target video."
+            ),
+        )
+
+    inventory = videos(
+        days=0,
+        limit=200,
+    ).get("videos", [])
+
+    target_duration = int(
+        target.get("duration_seconds", 0)
+    )
+
+    if target_duration <= 0:
+        raise HTTPException(
+            status_code=502,
+            detail=(
+                "The target video has no usable duration."
+            ),
+        )
+
+    required_days = int(window)
+    yesterday = date.today() - timedelta(days=1)
+
+    latest_complete_publish_date = (
+        yesterday
+        - timedelta(days=required_days - 1)
+    )
+
+    candidates = []
+
+    for candidate in inventory:
+        candidate_id = candidate.get("video_id")
+
+        if (
+            not candidate_id
+            or candidate_id == video_id
+        ):
+            continue
+
+        if (
+            candidate.get("privacy_status")
+            != "public"
+        ):
+            continue
+
+        duration = int(
+            candidate.get("duration_seconds", 0)
+        )
+
+        # Exclude Shorts and very short videos.
+        if duration < 180:
+            continue
+
+        published_at = candidate.get(
+            "published_at"
+        )
+
+        if not published_at:
+            continue
+
+        published_date = date.fromisoformat(
+            published_at[:10]
+        )
+
+        if (
+            published_date
+            > latest_complete_publish_date
+        ):
+            continue
+
+        runtime_difference = abs(
+            duration - target_duration
+        ) / target_duration
+
+        candidates.append({
+            **candidate,
+            "runtime_difference_fraction": (
+                runtime_difference
+            ),
+        })
+
+    primary_pool = [
+        candidate
+        for candidate in candidates
+        if candidate[
+            "runtime_difference_fraction"
+        ] <= runtime_tolerance
+    ]
+
+    tolerance_used = runtime_tolerance
+    candidate_pool = primary_pool
+
+    # Expand the runtime range only when fewer than
+    # five reasonably comparable videos are available.
+    if len(candidate_pool) < 5:
+        tolerance_used = 0.50
+
+        candidate_pool = [
+            candidate
+            for candidate in candidates
+            if candidate[
+                "runtime_difference_fraction"
+            ] <= tolerance_used
+        ]
+
+    candidate_pool.sort(
+        key=lambda candidate: (
+            candidate[
+                "runtime_difference_fraction"
+            ],
+            -int(candidate.get("views", 0)),
+        )
+    )
+
+    peer_videos = []
+
+    for candidate in candidate_pool:
+        if len(peer_videos) >= max_peers:
+            break
+
+        try:
+            peer = video_retention(
+                video_id=candidate["video_id"],
+                window=window,
+            )
+        except HTTPException:
+            continue
+
+        if (
+            not peer.get("window_complete")
+            or not peer.get("summary")
+        ):
+            continue
+
+        peer_videos.append({
+            "video_id": candidate["video_id"],
+            "title": candidate["title"],
+            "published_at": (
+                candidate["published_at"]
+            ),
+            "duration_seconds": (
+                candidate["duration_seconds"]
+            ),
+            "runtime_minutes": (
+                candidate["runtime_minutes"]
+            ),
+            "runtime_difference_percent": round(
+                candidate[
+                    "runtime_difference_fraction"
+                ] * 100,
+                1,
+            ),
+            "checkpoints": peer["summary"],
+        })
+
+    checkpoint_benchmarks = {}
+
+    for checkpoint_name, target_point in (
+        target_summary.items()
+    ):
+        if not target_point:
+            continue
+
+        peer_values = [
+            peer["checkpoints"][checkpoint_name][
+                "audience_retention_percent"
+            ]
+            for peer in peer_videos
+            if peer["checkpoints"].get(
+                checkpoint_name
+            )
+        ]
+
+        checkpoint_benchmarks[
+            checkpoint_name
+        ] = {
+            **summarize_checkpoint(
+                target_point[
+                    "audience_retention_percent"
+                ],
+                peer_values,
+            ),
+            "target_elapsed_seconds": (
+                target_point["elapsed_seconds"]
+            ),
+            "youtube_relative_retention_score": (
+                target_point[
+                    "relative_retention_score"
+                ]
+            ),
+        }
+
+    peer_count = len(peer_videos)
+
+    if peer_count >= 5:
+        benchmark_status = (
+            "PASS"
+            if tolerance_used
+            <= runtime_tolerance
+            else "WARN"
+        )
+    elif peer_count >= 3:
+        benchmark_status = "WARN"
+    else:
+        benchmark_status = "FAIL"
+
+    return {
+        "benchmark_status": benchmark_status,
+        "video_id": video_id,
+        "title": target.get("title"),
+        "window": window,
+        "comparison_basis": {
+            "same_fixed_window": True,
+            "runtime_minutes": target.get(
+                "runtime_minutes"
+            ),
+            "requested_runtime_tolerance_percent": (
+                round(
+                    runtime_tolerance * 100,
+                    1,
+                )
+            ),
+            "runtime_tolerance_used_percent": (
+                round(
+                    tolerance_used * 100,
+                    1,
+                )
+            ),
+            "peer_sample_size": peer_count,
+            "minimum_preferred_peer_sample": 5,
+        },
+        "checkpoint_benchmarks": (
+            checkpoint_benchmarks
+        ),
+        "peer_videos": peer_videos,
+        "interpretation_rules": [
+            (
+                "Channel percentile compares the "
+                "target only with the peer videos "
+                "returned in this report."
+            ),
+            (
+                "YouTube relative retention compares "
+                "the target with all YouTube videos "
+                "of similar length."
+            ),
+            (
+                "Neither benchmark proves why viewers "
+                "left. Review the footage at the "
+                "relevant timestamp before making an "
+                "editorial diagnosis."
+            ),
+            (
+                "WARN means the peer set was small "
+                "or required a wider runtime range."
+            ),
+            (
+                "FAIL is insufficient for a "
+                "channel-specific conclusion."
+            ),
+        ],
+        "recommendation_allowed": (
+            benchmark_status
+            in {"PASS", "WARN"}
+        ),
+    }
