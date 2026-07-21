@@ -1447,3 +1447,363 @@ def retention_benchmark(
             in {"PASS", "WARN"}
         ),
     }
+
+
+# --- JIMPORTS FORMAT-AWARE BENCHMARK V1 ---
+
+from app.tagging_layer import (
+    classify_video,
+    shared_topics,
+)
+
+
+@app.get(
+    "/videos/catalog",
+    operation_id="getVideoCatalog",
+    summary="List videos with auditable format and topic classifications",
+    dependencies=[Depends(require_api_key)],
+)
+def video_catalog(
+    limit: int = Query(default=100, ge=1, le=200),
+):
+    inventory = videos(
+        days=0,
+        limit=limit,
+    ).get("videos", [])
+
+    classified = []
+
+    for video in inventory:
+        classified.append({
+            **video,
+            "classification": classify_video(video),
+        })
+
+    return {
+        "video_count": len(classified),
+        "classification_warning": (
+            "Manual overrides are verified editorial labels. "
+            "Automatic title rules are suggestions and must be "
+            "disclosed when used."
+        ),
+        "videos": classified,
+    }
+
+
+@app.get(
+    "/video/{video_id}/retention-benchmark-tagged",
+    operation_id="benchmarkVideoRetentionByFormat",
+    summary=(
+        "Compare fixed-window retention with Jimports videos "
+        "classified as the same format"
+    ),
+    dependencies=[Depends(require_api_key)],
+)
+def retention_benchmark_tagged(
+    video_id: str,
+    window: str = Query(
+        default="7",
+        pattern="^(7|28)$",
+    ),
+    max_peers: int = Query(
+        default=8,
+        ge=3,
+        le=12,
+    ),
+    runtime_tolerance: float = Query(
+        default=0.50,
+        ge=0.20,
+        le=1.00,
+        description=(
+            "Maximum proportional runtime difference. "
+            "0.50 means plus or minus 50 percent."
+        ),
+    ),
+):
+    target_retention = video_retention(
+        video_id=video_id,
+        window=window,
+    )
+
+    if not target_retention.get("window_complete"):
+        return {
+            "benchmark_status": "FAIL",
+            "video_id": video_id,
+            "window": window,
+            "reason": (
+                f"The target video's first {window}-day "
+                "window is incomplete."
+            ),
+            "recommendation_allowed": False,
+        }
+
+    target_record = {
+        "video_id": video_id,
+        "title": target_retention.get("title", ""),
+        "duration_seconds": target_retention.get(
+            "duration_seconds",
+            0,
+        ),
+    }
+
+    target_classification = classify_video(target_record)
+
+    if target_classification["format"] == "unclassified":
+        return {
+            "benchmark_status": "FAIL",
+            "video_id": video_id,
+            "title": target_retention.get("title"),
+            "window": window,
+            "target_classification": target_classification,
+            "reason": (
+                "The target video has no reliable format "
+                "classification. Add a manual override before "
+                "using a format-aware benchmark."
+            ),
+            "recommendation_allowed": False,
+        }
+
+    target_duration = int(
+        target_retention.get("duration_seconds", 0)
+    )
+
+    required_days = int(window)
+    yesterday = date.today() - timedelta(days=1)
+    latest_complete_publish_date = (
+        yesterday - timedelta(days=required_days - 1)
+    )
+
+    inventory = videos(
+        days=0,
+        limit=200,
+    ).get("videos", [])
+
+    candidates = []
+
+    for video in inventory:
+        candidate_id = video.get("video_id")
+
+        if not candidate_id or candidate_id == video_id:
+            continue
+
+        if video.get("privacy_status") != "public":
+            continue
+
+        duration = int(video.get("duration_seconds", 0))
+
+        if duration < 180 or target_duration <= 0:
+            continue
+
+        published_at = video.get("published_at")
+
+        if not published_at:
+            continue
+
+        published_date = date.fromisoformat(
+            published_at[:10]
+        )
+
+        if published_date > latest_complete_publish_date:
+            continue
+
+        runtime_difference = (
+            abs(duration - target_duration)
+            / target_duration
+        )
+
+        if runtime_difference > runtime_tolerance:
+            continue
+
+        classification = classify_video(video)
+
+        if (
+            classification["format"]
+            != target_classification["format"]
+        ):
+            continue
+
+        common_topics = shared_topics(
+            target_classification,
+            classification,
+        )
+
+        candidates.append({
+            **video,
+            "classification": classification,
+            "shared_topics": common_topics,
+            "runtime_difference_percent": round(
+                runtime_difference * 100,
+                1,
+            ),
+        })
+
+    candidates.sort(
+        key=lambda candidate: (
+            -len(candidate["shared_topics"]),
+            -candidate["classification"][
+                "classification_confidence"
+            ],
+            candidate["runtime_difference_percent"],
+            -int(candidate.get("views", 0)),
+        )
+    )
+
+    peers = []
+
+    for candidate in candidates:
+        if len(peers) >= max_peers:
+            break
+
+        try:
+            peer_retention = video_retention(
+                video_id=candidate["video_id"],
+                window=window,
+            )
+        except HTTPException:
+            continue
+
+        if (
+            not peer_retention.get("window_complete")
+            or not peer_retention.get("summary")
+        ):
+            continue
+
+        peers.append({
+            "video_id": candidate["video_id"],
+            "title": candidate["title"],
+            "published_at": candidate["published_at"],
+            "duration_seconds": candidate[
+                "duration_seconds"
+            ],
+            "runtime_minutes": candidate[
+                "runtime_minutes"
+            ],
+            "runtime_difference_percent": candidate[
+                "runtime_difference_percent"
+            ],
+            "classification": candidate[
+                "classification"
+            ],
+            "shared_topics": candidate["shared_topics"],
+            "checkpoints": peer_retention["summary"],
+        })
+
+    target_summary = target_retention.get(
+        "summary",
+        {},
+    )
+
+    checkpoint_benchmarks = {}
+
+    for checkpoint_name, target_point in (
+        target_summary.items()
+    ):
+        if not target_point:
+            continue
+
+        peer_values = [
+            peer["checkpoints"][checkpoint_name][
+                "audience_retention_percent"
+            ]
+            for peer in peers
+            if peer["checkpoints"].get(checkpoint_name)
+        ]
+
+        checkpoint_benchmarks[checkpoint_name] = {
+            **summarize_checkpoint(
+                target_point[
+                    "audience_retention_percent"
+                ],
+                peer_values,
+            ),
+            "target_elapsed_seconds": target_point[
+                "elapsed_seconds"
+            ],
+            "youtube_relative_retention_score": (
+                target_point[
+                    "relative_retention_score"
+                ]
+            ),
+        }
+
+    peer_count = len(peers)
+    automatic_peer_count = sum(
+        peer["classification"][
+            "classification_source"
+        ] == "automatic_title_rule"
+        for peer in peers
+    )
+
+    if peer_count >= 5:
+        benchmark_status = "PASS"
+    elif peer_count >= 3:
+        benchmark_status = "WARN"
+    else:
+        benchmark_status = "FAIL"
+
+    limitations = []
+
+    if automatic_peer_count:
+        limitations.append(
+            f"{automatic_peer_count} peer classifications "
+            "were generated from title rules rather than "
+            "manual editorial review."
+        )
+
+    if peer_count < 5:
+        limitations.append(
+            "The peer sample is below the preferred minimum "
+            "of five videos."
+        )
+
+    if not any(peer["shared_topics"] for peer in peers):
+        limitations.append(
+            "The peers match format but none share a detected "
+            "topic with the target."
+        )
+
+    return {
+        "benchmark_status": benchmark_status,
+        "video_id": video_id,
+        "title": target_retention.get("title"),
+        "window": window,
+        "target_classification": target_classification,
+        "comparison_basis": {
+            "same_fixed_window": True,
+            "same_format_required": True,
+            "format": target_classification["format"],
+            "runtime_tolerance_percent": round(
+                runtime_tolerance * 100,
+                1,
+            ),
+            "peer_sample_size": peer_count,
+            "minimum_preferred_peer_sample": 5,
+            "automatic_peer_classifications": (
+                automatic_peer_count
+            ),
+        },
+        "checkpoint_benchmarks": checkpoint_benchmarks,
+        "peer_videos": peers,
+        "limitations": limitations,
+        "interpretation_rules": [
+            (
+                "PASS confirms adequate sample size, not that "
+                "every peer is editorially identical."
+            ),
+            (
+                "Automatic title classifications must be "
+                "disclosed and may require manual correction."
+            ),
+            (
+                "FAIL means the system lacks enough comparable "
+                "videos for a channel-specific conclusion."
+            ),
+            (
+                "Retention identifies where viewer behavior "
+                "changed, not why it changed."
+            ),
+        ],
+        "recommendation_allowed": (
+            benchmark_status in {"PASS", "WARN"}
+        ),
+    }
