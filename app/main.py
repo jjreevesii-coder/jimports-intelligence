@@ -794,3 +794,324 @@ def video_traffic_sources(
             status_code=502,
             detail=f"YouTube API error: {error}",
         ) from error
+
+
+# --- JIMPORTS AUDIT LAYER V1 ---
+
+from app.audit_layer import (
+    TRAFFIC_SOURCE_MAPPING_VERSION,
+    VALIDATED_TRAFFIC_SOURCE_LABELS,
+    boolean_check,
+    overall_status,
+    reconciliation_check,
+    traffic_source_label,
+)
+
+
+@app.get(
+    "/video/{video_id}/subscribed-status",
+    operation_id="getVideoSubscribedStatus",
+    summary="Get views from subscribed and unsubscribed viewers",
+    dependencies=[Depends(require_api_key)],
+)
+def video_subscribed_status(
+    video_id: str,
+    window: str = Query(
+        default="lifetime",
+        pattern="^(7|28|lifetime)$",
+    ),
+):
+    try:
+        youtube, analytics = get_services()
+
+        (
+            metadata,
+            start_date,
+            end_date,
+            complete,
+        ) = resolve_video_window(
+            youtube,
+            video_id,
+            window,
+        )
+
+        if end_date < start_date:
+            return {
+                **metadata,
+                "window": window,
+                "window_complete": complete,
+                "viewer_statuses": [],
+            }
+
+        report = analytics.reports().query(
+            ids="channel==MINE",
+            startDate=start_date.isoformat(),
+            endDate=end_date.isoformat(),
+            dimensions="subscribedStatus",
+            metrics=(
+                "views,estimatedMinutesWatched,"
+                "averageViewDuration,averageViewPercentage"
+            ),
+            filters=f"video=={video_id}",
+        ).execute()
+
+        headers = [
+            column["name"]
+            for column in report.get("columnHeaders", [])
+        ]
+
+        rows = [
+            dict(zip(headers, row))
+            for row in report.get("rows", [])
+        ]
+
+        total_views = sum(
+            int(row.get("views", 0))
+            for row in rows
+        )
+
+        viewer_statuses = []
+
+        for row in rows:
+            status = str(row.get("subscribedStatus", "UNKNOWN"))
+            views = int(row.get("views", 0))
+
+            viewer_statuses.append({
+                "subscribed_status": status,
+                "views": views,
+                "share_of_views_percent": (
+                    round(views / total_views * 100, 2)
+                    if total_views
+                    else 0
+                ),
+                "watch_hours": round(
+                    float(
+                        row.get("estimatedMinutesWatched", 0)
+                    ) / 60,
+                    2,
+                ),
+                "average_view_duration_seconds": round(
+                    float(row.get("averageViewDuration", 0)),
+                    1,
+                ),
+                "average_percentage_viewed": round(
+                    float(row.get("averageViewPercentage", 0)),
+                    2,
+                ),
+            })
+
+        viewer_statuses.sort(
+            key=lambda value: value["views"],
+            reverse=True,
+        )
+
+        return {
+            **metadata,
+            "window": window,
+            "period_start": start_date.isoformat(),
+            "period_end": end_date.isoformat(),
+            "window_complete": complete,
+            "total_views_in_report": total_views,
+            "viewer_statuses": viewer_statuses,
+        }
+
+    except HttpError as error:
+        raise HTTPException(
+            status_code=502,
+            detail=f"YouTube API error: {error}",
+        ) from error
+
+
+@app.get(
+    "/video/{video_id}/audit",
+    operation_id="auditVideo",
+    summary=(
+        "Audit one video's performance, traffic, subscriber status, "
+        "and retention before strategic interpretation"
+    ),
+    dependencies=[Depends(require_api_key)],
+)
+def audit_video(
+    video_id: str,
+    window: str = Query(
+        default="lifetime",
+        pattern="^(7|28|lifetime)$",
+    ),
+):
+    performance = video_performance(
+        video_id=video_id,
+        window=window,
+    )
+
+    traffic = video_traffic_sources(
+        video_id=video_id,
+        window=window,
+    )
+
+    retention = video_retention(
+        video_id=video_id,
+        window=window,
+    )
+
+    subscriber_status = video_subscribed_status(
+        video_id=video_id,
+        window=window,
+    )
+
+    performance_views = int(performance.get("views", 0))
+    traffic_views = int(
+        traffic.get("total_views_in_report", 0)
+    )
+    subscriber_status_views = int(
+        subscriber_status.get("total_views_in_report", 0)
+    )
+
+    audited_sources = []
+    unknown_source_codes = []
+
+    for source in traffic.get("sources", []):
+        raw_code = str(
+            source.get("source_type", "")
+        )
+
+        if raw_code not in VALIDATED_TRAFFIC_SOURCE_LABELS:
+            unknown_source_codes.append(raw_code)
+
+        audited_sources.append({
+            **source,
+            "raw_source_code": raw_code,
+            "studio_label": traffic_source_label(raw_code),
+            "mapping_version": TRAFFIC_SOURCE_MAPPING_VERSION,
+        })
+
+    periods = {
+        (
+            performance.get("period_start"),
+            performance.get("period_end"),
+        ),
+        (
+            traffic.get("period_start"),
+            traffic.get("period_end"),
+        ),
+        (
+            retention.get("period_start"),
+            retention.get("period_end"),
+        ),
+        (
+            subscriber_status.get("period_start"),
+            subscriber_status.get("period_end"),
+        ),
+    }
+
+    retention_points = retention.get("points", [])
+
+    relative_values = [
+        point.get("relative_retention_score")
+        for point in retention_points
+        if point.get("relative_retention_score") is not None
+    ]
+
+    relative_values_valid = all(
+        0 <= float(value) <= 1
+        for value in relative_values
+    )
+
+    checks = [
+        reconciliation_check(
+            "Traffic-source views reconcile to video views",
+            performance_views,
+            traffic_views,
+        ),
+        reconciliation_check(
+            "Subscribed-status views reconcile to video views",
+            performance_views,
+            subscriber_status_views,
+        ),
+        boolean_check(
+            "Reporting periods match",
+            len(periods) == 1,
+            (
+                f"Observed reporting periods: "
+                f"{sorted(str(value) for value in periods)}"
+            ),
+        ),
+        boolean_check(
+            "Traffic-source codes are validated",
+            not unknown_source_codes,
+            (
+                "Unknown codes: "
+                + ", ".join(unknown_source_codes)
+                if unknown_source_codes
+                else (
+                    "All traffic-source codes use the validated "
+                    f"{TRAFFIC_SOURCE_MAPPING_VERSION} mapping."
+                )
+            ),
+            failure_status="WARN",
+        ),
+        boolean_check(
+            "Retention curve returned",
+            bool(retention_points),
+            f"Retention point count: {len(retention_points)}",
+        ),
+        boolean_check(
+            "Relative-retention values are valid",
+            bool(relative_values) and relative_values_valid,
+            (
+                "relativeRetentionPerformance values must be "
+                "between 0 and 1."
+            ),
+        ),
+    ]
+
+    status = overall_status(checks)
+
+    return {
+        "audit_status": status,
+        "video_id": video_id,
+        "title": performance.get("title"),
+        "window": window,
+        "window_complete": performance.get("window_complete"),
+        "period_start": performance.get("period_start"),
+        "period_end": performance.get("period_end"),
+        "data_quality_checks": checks,
+        "verified_data": {
+            "performance": performance,
+            "traffic_sources": {
+                "mapping_version": (
+                    TRAFFIC_SOURCE_MAPPING_VERSION
+                ),
+                "total_views_in_report": traffic_views,
+                "sources": audited_sources,
+            },
+            "viewer_subscription_status": subscriber_status,
+            "retention_checkpoints": retention.get("summary", {}),
+            "retention_point_count": len(retention_points),
+        },
+        "interpretation_rules": [
+            (
+                "Traffic-source code SUBSCRIBER means Browse "
+                "features, including homepage feeds and subscription "
+                "features. It does not identify whether the viewer "
+                "was subscribed."
+            ),
+            (
+                "Use viewer_subscription_status for subscribed versus "
+                "unsubscribed viewers."
+            ),
+            (
+                "Use relative_retention_score to benchmark a retention "
+                "checkpoint against similarly sized YouTube videos. "
+                "A value of 0.5 is the median."
+            ),
+            (
+                "A retention curve identifies when viewers stopped, "
+                "rewatched, or skipped. It does not prove why."
+            ),
+            (
+                "Determining the likely editorial cause of a decline "
+                "requires reviewing the footage at that timestamp."
+            ),
+        ],
+        "recommendation_allowed": status in {"PASS", "WARN"},
+    }
