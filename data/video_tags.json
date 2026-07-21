@@ -1,0 +1,37 @@
+{
+  "Y8JFlS089VA": {
+    "format": "ownership_story",
+    "topics": ["toyota", "jdm", "import", "rare_car"],
+    "notes": "Toyota Origin acquisition and ownership story"
+  },
+  "lyPSqwrqRnk": {
+    "format": "ownership_story",
+    "topics": ["toyota", "jdm", "ownership"],
+    "notes": "Tiny Toyota ownership profile"
+  },
+  "4rX2tE0HBjc": {
+    "format": "vehicle_documentary",
+    "topics": ["military_vehicle", "european_vehicle"],
+    "notes": "Pinzgauer vehicle profile"
+  },
+  "PGTpuK8Hf00": {
+    "format": "vehicle_documentary",
+    "topics": ["mercedes", "military_vehicle", "off_road"],
+    "notes": "G-Wagen historical vehicle profile"
+  },
+  "KP54mTJIxjM": {
+    "format": "travel_guide_list",
+    "topics": ["japan", "car_culture", "travel"],
+    "notes": "Tokyo car-attraction list"
+  },
+  "B4H05yPJI7M": {
+    "format": "event_or_museum",
+    "topics": ["nissan", "jdm", "japan", "car_event"],
+    "notes": "Skyline meeting event coverage"
+  },
+  "s-PPGLVPHNk": {
+    "format": "buyer_guide_list",
+    "topics": ["jdm", "import", "buyer_guide"],
+    "notes": "Import recommendation list"
+  }
+}
